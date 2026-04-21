@@ -1,1 +1,5 @@
+.env
 data/parquet/
+data/model/
+data/cache/
+data/images/
