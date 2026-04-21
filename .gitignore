@@ -3,3 +3,8 @@ data/parquet/
 data/model/
 data/cache/
 data/images/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
