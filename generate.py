@@ -1,12 +1,12 @@
 """
-Henreader Style LoRA - 고품질 통합 이미지 생성 스크립트
-Base: Stable Diffusion anything-v5 + LoRA + MSE VAE + Euler a
-기능: WD14 태거 자동 분석 + 비율 유지 정밀 img2img/txt2img + 화질 뭉개짐 방지
+Henreader Style - Extreme Depth LoRA 전용 이미지 생성 스크립트
+Base: Stable Diffusion anything-v5 + LoRA (Rank 128) + MSE VAE + Euler a
+기능: 고밀도 가중치 제어 + WD14 태거 자동 분석 + 비율 유지 정밀 크롭
 
 사용법:
     python generate.py                            # input/ 이미지 자동 처리 (img2img)
-    python generate.py --prompt "1girl, solo"     # 태거 무시하고 직접 프롬프트 입력
-    python generate.py --lora_weight 0.5          # LoRA 강도 조절 (0.4~0.6 권장)
+    python generate.py --prompt "1girl, solo"     # 텍스트 전용 생성 (txt2img)
+    python generate.py --lora_weight 0.6          # 극한 학습 로라 권장 가중치 (0.4~0.7)
 """
 
 import argparse
@@ -23,7 +23,9 @@ from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
 
 
-# 설정 및 경로 
+# ── 1. 설정 및 경로 ────────────────────────────────────────────────────────────
+
+# 극한 학습을 마친 pytorch_lora_weights.safetensors 파일의 경로를 정확히 맞추십시오.
 LORA_PATH = Path(__file__).parent / "data/model/pytorch_lora_weights.safetensors"
 BASE_MODEL = "stablediffusionapi/anything-v5"
 INPUT_DIR = Path(__file__).parent / "input"
@@ -32,14 +34,14 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 TRIGGER = "henreader style"
-DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, flat color, masterpiece, best quality"
+DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, flat color, highly detailed, masterpiece, best quality"
 NEGATIVE_PROMPT = (
     "photorealistic, 3d, cg, realistic, lowres, bad anatomy, bad hands, text, "
-    "error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
+    "error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, jpeg artifacts"
 )
 
 
-# WD14 태거 (이미지 분석 도구) 
+# ── 2. WD14 태거 (정밀 이미지 분석 도구) ──────────────────────────────────────────
 
 def load_wd14_tagger():
     print("WD14 태거 모델 다운로드 및 로딩 중...")
@@ -73,7 +75,7 @@ def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str
     return ", ".join(tag.replace("_", " ") for tag, _ in results)
 
 
-# SD 파이프라인 (이미지 생성 엔진) 
+# ── 3. SD 파이프라인 (고해상도 렌더링 엔진) ────────────────────────────────────────
 
 def get_device():
     if torch.cuda.is_available():
@@ -86,6 +88,7 @@ def get_device():
 def build_txt2img_pipeline(device: str, dtype: torch.dtype):
     print(f"txt2img 모델 및 고화질 VAE 로딩: {BASE_MODEL}")
     
+    # 색채 뭉개짐을 완벽히 방어하는 고정밀 디코더(VAE) 로드
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
     
     pipe = StableDiffusionPipeline.from_pretrained(
@@ -95,6 +98,7 @@ def build_txt2img_pipeline(device: str, dtype: torch.dtype):
         safety_checker=None
     )
     
+    # 2D 애니메이션 선화 처리에 특화된 Euler a 샘플러 강제 적용
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     
     pipe.load_lora_weights(str(LORA_PATH))
@@ -144,6 +148,7 @@ def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
     print(f"실행 프롬프트: {full_prompt}")
     
+    # 비율 왜곡 원천 차단: 고정밀 LANCZOS 필터 기반 중앙 크롭
     input_image = ImageOps.fit(
         input_image.convert("RGB"), 
         (512, 512), 
@@ -181,15 +186,16 @@ def collect_input_images() -> list[Path]:
     return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
 
 
-# 메인 컨트롤러 
+# ── 4. 메인 컨트롤러 ───────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Henreader Style LoRA Generator")
+    parser = argparse.ArgumentParser(description="Henreader Style LoRA Generator (Extreme Depth)")
     parser.add_argument("--prompt", type=str, default=None, help="커스텀 프롬프트 (미지정 시 자동 분석)")
     parser.add_argument("--count", type=int, default=1, help="장당 생성 수")
     parser.add_argument("--steps", type=int, default=30, help="샘플링 단계 (기본 30)")
     parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
-    parser.add_argument("--lora_weight", type=float, default=0.3, help="LoRA 가중치 (기본 0.5)")
+    # 극한 학습 로라에 맞춰 기본 가중치를 0.6으로 하향 조정
+    parser.add_argument("--lora_weight", type=float, default=0.6, help="LoRA 가중치 (기본 0.6)")
     parser.add_argument("--strength", type=float, default=0.65, help="img2img 변형 강도 (기본 0.65)")
     parser.add_argument("--threshold", type=float, default=0.35, help="태거 민감도 (기본 0.35)")
     args = parser.parse_args()
