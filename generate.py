@@ -1,15 +1,16 @@
 """
-Henreader Style LoRA - 통합 이미지 생성 스크립트 (수정판)
-Base: Stable Diffusion anything-v5 + LoRA
-기능: WD14 태거 자동 분석 + 비율 유지 정밀 img2img/txt2img
+Henreader Style LoRA - 고품질 통합 이미지 생성 스크립트
+Base: Stable Diffusion anything-v5 + LoRA + MSE VAE + Euler a
+기능: WD14 태거 자동 분석 + 비율 유지 정밀 img2img/txt2img + 화질 뭉개짐 방지
 
 사용법:
     python generate.py                            # input/ 이미지 자동 처리 (img2img)
     python generate.py --prompt "1girl, solo"     # 태거 무시하고 직접 프롬프트 입력
-    python generate.py --lora_weight 0.9          # LoRA 강도 조절 (0.6~1.0 권장)
+    python generate.py --lora_weight 0.5          # LoRA 강도 조절 (0.4~0.6 권장)
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +18,12 @@ import onnxruntime as ort
 import pandas as pd
 import torch
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
+from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
 
 
-# ── 설정 및 경로 ──────────────────────────────────────────────────────────────
-# 훈련 시 사용했던 LoRA 파일 이름이 pytorch_lora_weights.safetensors 인지 확인하세요.
+# 설정 및 경로 
 LORA_PATH = Path(__file__).parent / "data/model/pytorch_lora_weights.safetensors"
 BASE_MODEL = "stablediffusionapi/anything-v5"
 INPUT_DIR = Path(__file__).parent / "input"
@@ -31,14 +32,14 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 TRIGGER = "henreader style"
-DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, high quality, masterpiece"
+DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, flat color, masterpiece, best quality"
 NEGATIVE_PROMPT = (
     "photorealistic, 3d, cg, realistic, lowres, bad anatomy, bad hands, text, "
     "error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
 )
 
 
-# ── WD14 태거 (이미지 분석 도구) ────────────────────────────────────────────────
+# WD14 태거 (이미지 분석 도구) 
 
 def load_wd14_tagger():
     print("WD14 태거 모델 다운로드 및 로딩 중...")
@@ -56,11 +57,10 @@ def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str
     img = image.convert("RGB")
     img.thumbnail((target, target), Image.Resampling.LANCZOS)
 
-    # 태거 분석용 패딩 이미지 생성 (비율 유지)
     canvas = Image.new("RGB", (target, target), (255, 255, 255))
     canvas.paste(img, ((target - img.width) // 2, (target - img.height) // 2))
 
-    arr = np.array(canvas, dtype=np.float32)[:, :, ::-1] # RGB to BGR
+    arr = np.array(canvas, dtype=np.float32)[:, :, ::-1]
     arr = np.expand_dims(arr, axis=0)
 
     input_name = session.get_inputs()[0].name
@@ -73,7 +73,7 @@ def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str
     return ", ".join(tag.replace("_", " ") for tag, _ in results)
 
 
-# ── SD 파이프라인 (이미지 생성 엔진) ───────────────────────────────────────────
+# SD 파이프라인 (이미지 생성 엔진) 
 
 def get_device():
     if torch.cuda.is_available():
@@ -84,10 +84,19 @@ def get_device():
 
 
 def build_txt2img_pipeline(device: str, dtype: torch.dtype):
-    print(f"txt2img 모델 로딩: {BASE_MODEL}")
+    print(f"txt2img 모델 및 고화질 VAE 로딩: {BASE_MODEL}")
+    
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+    
     pipe = StableDiffusionPipeline.from_pretrained(
-        BASE_MODEL, torch_dtype=dtype, safety_checker=None
+        BASE_MODEL, 
+        vae=vae,
+        torch_dtype=dtype, 
+        safety_checker=None
     )
+    
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -96,10 +105,19 @@ def build_txt2img_pipeline(device: str, dtype: torch.dtype):
 
 
 def build_img2img_pipeline(device: str, dtype: torch.dtype):
-    print(f"img2img 모델 로딩: {BASE_MODEL}")
+    print(f"img2img 모델 및 고화질 VAE 로딩: {BASE_MODEL}")
+    
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+    
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        BASE_MODEL, torch_dtype=dtype, safety_checker=None
+        BASE_MODEL, 
+        vae=vae,
+        torch_dtype=dtype, 
+        safety_checker=None
     )
+    
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -126,7 +144,6 @@ def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
     print(f"실행 프롬프트: {full_prompt}")
     
-    # [수정 핵심] 비율을 무시하는 resize 대신 ImageOps.fit으로 비율 유지하며 512x512 크롭
     input_image = ImageOps.fit(
         input_image.convert("RGB"), 
         (512, 512), 
@@ -164,15 +181,15 @@ def collect_input_images() -> list[Path]:
     return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
 
 
-# ── 메인 컨트롤러 ─────────────────────────────────────────────────────────────
+# 메인 컨트롤러 
 
 def main():
     parser = argparse.ArgumentParser(description="Henreader Style LoRA Generator")
     parser.add_argument("--prompt", type=str, default=None, help="커스텀 프롬프트 (미지정 시 자동 분석)")
     parser.add_argument("--count", type=int, default=1, help="장당 생성 수")
     parser.add_argument("--steps", type=int, default=30, help="샘플링 단계 (기본 30)")
-    parser.add_argument("--cfg", type=float, default=7.5, help="CFG Scale (기본 7.5)")
-    parser.add_argument("--lora_weight", type=float, default=0.85, help="LoRA 가중치 (기본 0.85)")
+    parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
+    parser.add_argument("--lora_weight", type=float, default=0.4, help="LoRA 가중치 (기본 0.5)")
     parser.add_argument("--strength", type=float, default=0.65, help="img2img 변형 강도 (기본 0.65)")
     parser.add_argument("--threshold", type=float, default=0.35, help="태거 민감도 (기본 0.35)")
     args = parser.parse_args()
