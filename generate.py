@@ -19,7 +19,7 @@ from PIL import Image
 
 
 LORA_PATH = Path(__file__).parent / "data/model/pytorch_lora_weights.safetensors"
-BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+BASE_MODEL = "stablediffusionapi/anything-v5"
 INPUT_DIR = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
