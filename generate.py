@@ -1,12 +1,12 @@
 """
-Henreader Style LoRA - 이미지 생성 스크립트
-Base: Stable Diffusion anything-v5 + LoRA (pytorch_lora_weights.safetensors)
-WD14 태거로 input/ 이미지에서 태그 자동 추출 후 img2img 변환
+Henreader Style LoRA - 통합 이미지 생성 스크립트 (수정판)
+Base: Stable Diffusion anything-v5 + LoRA
+기능: WD14 태거 자동 분석 + 비율 유지 정밀 img2img/txt2img
 
 사용법:
-  python generate.py                          # input/ 이미지 자동 처리
-  python generate.py --prompt "1girl, solo"   # 커스텀 프롬프트 (태거 무시)
-  python generate.py --count 4               # 여러 장 생성
+    python generate.py                            # input/ 이미지 자동 처리 (img2img)
+    python generate.py --prompt "1girl, solo"     # 태거 무시하고 직접 프롬프트 입력
+    python generate.py --lora_weight 0.9          # LoRA 강도 조절 (0.6~1.0 권장)
 """
 
 import argparse
@@ -18,9 +18,11 @@ import pandas as pd
 import torch
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, ImageOps
 
 
+# ── 설정 및 경로 ──────────────────────────────────────────────────────────────
+# 훈련 시 사용했던 LoRA 파일 이름이 pytorch_lora_weights.safetensors 인지 확인하세요.
 LORA_PATH = Path(__file__).parent / "data/model/pytorch_lora_weights.safetensors"
 BASE_MODEL = "stablediffusionapi/anything-v5"
 INPUT_DIR = Path(__file__).parent / "input"
@@ -31,15 +33,15 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 TRIGGER = "henreader style"
 DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, high quality, masterpiece"
 NEGATIVE_PROMPT = (
-    "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, "
-    "fewer digits, cropped, worst quality, low quality"
+    "photorealistic, 3d, cg, realistic, lowres, bad anatomy, bad hands, text, "
+    "error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality"
 )
 
 
-# ── WD14 태거 ──────────────────────────────────────────────────────────────────
+# ── WD14 태거 (이미지 분석 도구) ────────────────────────────────────────────────
 
 def load_wd14_tagger():
-    print("WD14 태거 모델 다운로드 중...")
+    print("WD14 태거 모델 다운로드 및 로딩 중...")
     repo_id = "SmilingWolf/wd-v1-4-convnextv2-tagger-v2"
     model_path = hf_hub_download(repo_id, "model.onnx")
     tags_path = hf_hub_download(repo_id, "selected_tags.csv")
@@ -54,10 +56,11 @@ def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str
     img = image.convert("RGB")
     img.thumbnail((target, target), Image.Resampling.LANCZOS)
 
+    # 태거 분석용 패딩 이미지 생성 (비율 유지)
     canvas = Image.new("RGB", (target, target), (255, 255, 255))
     canvas.paste(img, ((target - img.width) // 2, (target - img.height) // 2))
 
-    arr = np.array(canvas, dtype=np.float32)[:, :, ::-1]
+    arr = np.array(canvas, dtype=np.float32)[:, :, ::-1] # RGB to BGR
     arr = np.expand_dims(arr, axis=0)
 
     input_name = session.get_inputs()[0].name
@@ -67,22 +70,24 @@ def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str
         (tags[i], preds[i]) for i in range(4, len(preds)) if preds[i] > threshold
     ]
     results.sort(key=lambda x: x[1], reverse=True)
-    return ", ".join(tag for tag, _ in results)
+    return ", ".join(tag.replace("_", " ") for tag, _ in results)
 
 
-# ── SD 파이프라인 ──────────────────────────────────────────────────────────────
+# ── SD 파이프라인 (이미지 생성 엔진) ───────────────────────────────────────────
 
 def get_device():
     if torch.cuda.is_available():
-        print(f"GPU 사용: {torch.cuda.get_device_name(0)}")
+        print(f"GPU 감지됨: {torch.cuda.get_device_name(0)}")
         return "cuda", torch.float16
-    print("GPU 없음 - CPU 사용 (속도가 느릴 수 있습니다)")
+    print("GPU 없음 - CPU 사용 (경고: 매우 느림)")
     return "cpu", torch.float32
 
 
 def build_txt2img_pipeline(device: str, dtype: torch.dtype):
-    print("txt2img 파이프라인 로딩 중...")
-    pipe = StableDiffusionPipeline.from_pretrained(BASE_MODEL, torch_dtype=dtype, safety_checker=None)
+    print(f"txt2img 모델 로딩: {BASE_MODEL}")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        BASE_MODEL, torch_dtype=dtype, safety_checker=None
+    )
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -91,8 +96,10 @@ def build_txt2img_pipeline(device: str, dtype: torch.dtype):
 
 
 def build_img2img_pipeline(device: str, dtype: torch.dtype):
-    print("img2img 파이프라인 로딩 중...")
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(BASE_MODEL, torch_dtype=dtype, safety_checker=None)
+    print(f"img2img 모델 로딩: {BASE_MODEL}")
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+        BASE_MODEL, torch_dtype=dtype, safety_checker=None
+    )
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -102,7 +109,7 @@ def build_img2img_pipeline(device: str, dtype: torch.dtype):
 
 def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
-    print(f"프롬프트: {full_prompt}")
+    print(f"실행 프롬프트: {full_prompt}")
     return pipe(
         prompt=full_prompt,
         negative_prompt=NEGATIVE_PROMPT,
@@ -117,8 +124,15 @@ def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
 
 def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
-    print(f"프롬프트: {full_prompt}")
-    input_image = input_image.convert("RGB").resize((512, 512), Image.LANCZOS)
+    print(f"실행 프롬프트: {full_prompt}")
+    
+    # [수정 핵심] 비율을 무시하는 resize 대신 ImageOps.fit으로 비율 유지하며 512x512 크롭
+    input_image = ImageOps.fit(
+        input_image.convert("RGB"), 
+        (512, 512), 
+        method=Image.Resampling.LANCZOS
+    )
+    
     return pipe(
         prompt=full_prompt,
         negative_prompt=NEGATIVE_PROMPT,
@@ -142,7 +156,7 @@ def save_images(images: list[Image.Image], prefix: str = "output"):
                 break
             idx += 1
         img.save(path)
-        print(f"저장: {path}")
+        print(f"결과 저장됨: {path}")
 
 
 def collect_input_images() -> list[Path]:
@@ -150,33 +164,33 @@ def collect_input_images() -> list[Path]:
     return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
 
 
-# ── 메인 ──────────────────────────────────────────────────────────────────────
+# ── 메인 컨트롤러 ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Henreader Style LoRA 이미지 생성")
-    parser.add_argument("--prompt", type=str, default=None, help="고정 프롬프트 (미지정시 WD14 태거 자동 추출)")
-    parser.add_argument("--count", type=int, default=1, help="생성할 이미지 수")
-    parser.add_argument("--steps", type=int, default=25, help="샘플링 스텝 수 (기본 25)")
-    parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
-    parser.add_argument("--lora_weight", type=float, default=0.8, help="LoRA 가중치 0.6~0.9 (기본 0.8)")
-    parser.add_argument("--strength", type=float, default=0.75, help="img2img 변형 강도 0~1 (기본 0.75)")
-    parser.add_argument("--threshold", type=float, default=0.35, help="WD14 태그 임계값 (기본 0.35)")
+    parser = argparse.ArgumentParser(description="Henreader Style LoRA Generator")
+    parser.add_argument("--prompt", type=str, default=None, help="커스텀 프롬프트 (미지정 시 자동 분석)")
+    parser.add_argument("--count", type=int, default=1, help="장당 생성 수")
+    parser.add_argument("--steps", type=int, default=30, help="샘플링 단계 (기본 30)")
+    parser.add_argument("--cfg", type=float, default=7.5, help="CFG Scale (기본 7.5)")
+    parser.add_argument("--lora_weight", type=float, default=0.85, help="LoRA 가중치 (기본 0.85)")
+    parser.add_argument("--strength", type=float, default=0.65, help="img2img 변형 강도 (기본 0.65)")
+    parser.add_argument("--threshold", type=float, default=0.35, help="태거 민감도 (기본 0.35)")
     args = parser.parse_args()
 
     if not LORA_PATH.exists():
-        print(f"오류: LoRA 파일을 찾을 수 없습니다 - {LORA_PATH}")
+        print(f"에러: LoRA 가중치 파일을 찾을 수 없습니다. 경로를 확인하세요: {LORA_PATH}")
         return
 
     device, dtype = get_device()
     input_images = collect_input_images()
 
     if input_images:
-        print(f"input/ 에서 {len(input_images)}개 이미지 발견 → img2img 모드")
+        print(f"'{INPUT_DIR}'에서 {len(input_images)}개의 이미지를 발견했습니다. img2img 모드로 시작합니다.")
         tagger_session, tag_list = load_wd14_tagger()
         pipe = build_img2img_pipeline(device, dtype)
 
         for input_path in input_images:
-            print(f"\n처리 중: {input_path.name}")
+            print(f"\n--- 작업 중: {input_path.name} ---")
             image = Image.open(input_path)
 
             if args.prompt:
@@ -184,18 +198,18 @@ def main():
             else:
                 extracted = tag_image(tagger_session, tag_list, image, args.threshold)
                 prompt = extracted
-                print(f"추출된 태그: {extracted}")
+                print(f"분석된 태그: {extracted}")
 
             images = generate_img2img(pipe, image, prompt, args)
             save_images(images, prefix=input_path.stem)
     else:
-        print("input/ 이미지 없음 → txt2img 모드")
+        print("input 폴더가 비어 있습니다. 텍스트(txt2img) 모드로 시작합니다.")
         pipe = build_txt2img_pipeline(device, dtype)
         prompt = args.prompt if args.prompt else DEFAULT_PROMPT
         images = generate_txt2img(pipe, prompt, args)
-        save_images(images, prefix="henreader")
+        save_images(images, prefix="henreader_gen")
 
-    print("\n완료!")
+    print("\n모든 작업이 완료되었습니다!")
 
 
 if __name__ == "__main__":
