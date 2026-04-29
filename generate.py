@@ -20,6 +20,7 @@ from PIL import Image
 
 LORA_PATH = Path(__file__).parent / "data/model/pytorch_lora_weights.safetensors"
 BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+INPUT_DIR = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
 TRIGGER = "henreader style"
@@ -121,16 +122,24 @@ def save_images(images: list[Image.Image], prefix: str = "output"):
     return saved
 
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+
+def collect_input_images() -> list[Path]:
+    if not INPUT_DIR.exists():
+        INPUT_DIR.mkdir(exist_ok=True)
+    images = sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    return images
+
+
 def main():
     parser = argparse.ArgumentParser(description="Henreader Style LoRA 이미지 생성")
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="생성 프롬프트")
-    parser.add_argument("--input", type=str, default=None, help="입력 이미지 경로 (img2img 모드)")
     parser.add_argument("--count", type=int, default=1, help="생성할 이미지 수")
     parser.add_argument("--steps", type=int, default=25, help="샘플링 스텝 수 (기본 25)")
     parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
     parser.add_argument("--lora_weight", type=float, default=0.8, help="LoRA 가중치 0.6~0.9 (기본 0.8)")
     parser.add_argument("--strength", type=float, default=0.75, help="img2img 변형 강도 0~1 (기본 0.75)")
-    parser.add_argument("--output_prefix", type=str, default="henreader", help="출력 파일명 접두사")
     args = parser.parse_args()
 
     if not LORA_PATH.exists():
@@ -138,21 +147,23 @@ def main():
         return
 
     device, dtype = get_device()
+    input_images = collect_input_images()
 
-    if args.input:
-        input_path = Path(args.input)
-        if not input_path.exists():
-            print(f"오류: 입력 이미지를 찾을 수 없습니다 - {input_path}")
-            return
-        input_image = Image.open(input_path)
+    if input_images:
+        print(f"input/ 에서 {len(input_images)}개 이미지 발견 → img2img 모드")
         pipe = build_img2img_pipeline(device, dtype)
-        images = generate_img2img(pipe, input_image, args.prompt, args)
+        for input_path in input_images:
+            print(f"\n처리 중: {input_path.name}")
+            input_image = Image.open(input_path)
+            images = generate_img2img(pipe, input_image, args.prompt, args)
+            save_images(images, prefix=input_path.stem)
     else:
+        print("input/ 이미지 없음 → txt2img 모드")
         pipe = build_txt2img_pipeline(device, dtype)
         images = generate_txt2img(pipe, args.prompt, args)
+        save_images(images, prefix="henreader")
 
-    save_images(images, prefix=args.output_prefix)
-    print("완료!")
+    print("\n완료!")
 
 
 if __name__ == "__main__":
