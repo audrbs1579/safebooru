@@ -1,20 +1,23 @@
 """
 Henreader Style LoRA - 이미지 생성 스크립트
-Base: Stable Diffusion v1.5 + LoRA (pytorch_lora_weights.safetensors)
+Base: Stable Diffusion anything-v5 + LoRA (pytorch_lora_weights.safetensors)
+WD14 태거로 input/ 이미지에서 태그 자동 추출 후 img2img 변환
 
 사용법:
-  python generate.py                          # 기본 프롬프트로 생성
-  python generate.py --prompt "1girl, solo"   # 커스텀 프롬프트
-  python generate.py --input image.png        # 입력 이미지 기반 img2img
+  python generate.py                          # input/ 이미지 자동 처리
+  python generate.py --prompt "1girl, solo"   # 커스텀 프롬프트 (태거 무시)
   python generate.py --count 4               # 여러 장 생성
 """
 
 import argparse
-import os
 from pathlib import Path
 
+import numpy as np
+import onnxruntime as ort
+import pandas as pd
 import torch
-from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
+from huggingface_hub import hf_hub_download
 from PIL import Image
 
 
@@ -23,6 +26,8 @@ BASE_MODEL = "stablediffusionapi/anything-v5"
 INPUT_DIR = Path(__file__).parent / "input"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
 TRIGGER = "henreader style"
 DEFAULT_PROMPT = "henreader style, 1girl, solo, looking at viewer, high quality, masterpiece"
 NEGATIVE_PROMPT = (
@@ -30,6 +35,42 @@ NEGATIVE_PROMPT = (
     "fewer digits, cropped, worst quality, low quality"
 )
 
+
+# ── WD14 태거 ──────────────────────────────────────────────────────────────────
+
+def load_wd14_tagger():
+    print("WD14 태거 모델 다운로드 중...")
+    repo_id = "SmilingWolf/wd-v1-4-convnextv2-tagger-v2"
+    model_path = hf_hub_download(repo_id, "model.onnx")
+    tags_path = hf_hub_download(repo_id, "selected_tags.csv")
+
+    tags = pd.read_csv(tags_path)["name"].tolist()
+    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    return session, tags
+
+
+def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str:
+    target = 448
+    img = image.convert("RGB")
+    img.thumbnail((target, target), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGB", (target, target), (255, 255, 255))
+    canvas.paste(img, ((target - img.width) // 2, (target - img.height) // 2))
+
+    arr = np.array(canvas, dtype=np.float32)[:, :, ::-1]
+    arr = np.expand_dims(arr, axis=0)
+
+    input_name = session.get_inputs()[0].name
+    preds = session.run(None, {input_name: arr})[0][0]
+
+    results = [
+        (tags[i], preds[i]) for i in range(4, len(preds)) if preds[i] > threshold
+    ]
+    results.sort(key=lambda x: x[1], reverse=True)
+    return ", ".join(tag for tag, _ in results)
+
+
+# ── SD 파이프라인 ──────────────────────────────────────────────────────────────
 
 def get_device():
     if torch.cuda.is_available():
@@ -40,12 +81,8 @@ def get_device():
 
 
 def build_txt2img_pipeline(device: str, dtype: torch.dtype):
-    print("파이프라인 로딩 중...")
-    pipe = StableDiffusionPipeline.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=dtype,
-        safety_checker=None,
-    )
+    print("txt2img 파이프라인 로딩 중...")
+    pipe = StableDiffusionPipeline.from_pretrained(BASE_MODEL, torch_dtype=dtype, safety_checker=None)
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -55,11 +92,7 @@ def build_txt2img_pipeline(device: str, dtype: torch.dtype):
 
 def build_img2img_pipeline(device: str, dtype: torch.dtype):
     print("img2img 파이프라인 로딩 중...")
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=dtype,
-        safety_checker=None,
-    )
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(BASE_MODEL, torch_dtype=dtype, safety_checker=None)
     pipe.load_lora_weights(str(LORA_PATH))
     pipe = pipe.to(device)
     if device == "cuda":
@@ -70,8 +103,7 @@ def build_img2img_pipeline(device: str, dtype: torch.dtype):
 def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
     print(f"프롬프트: {full_prompt}")
-
-    images = pipe(
+    return pipe(
         prompt=full_prompt,
         negative_prompt=NEGATIVE_PROMPT,
         width=512,
@@ -81,17 +113,13 @@ def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
         num_images_per_prompt=args.count,
         cross_attention_kwargs={"scale": args.lora_weight},
     ).images
-    return images
 
 
 def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
     print(f"프롬프트: {full_prompt}")
-
-    # 512x512 리사이즈 (비율 유지 후 크롭)
     input_image = input_image.convert("RGB").resize((512, 512), Image.LANCZOS)
-
-    images = pipe(
+    return pipe(
         prompt=full_prompt,
         negative_prompt=NEGATIVE_PROMPT,
         image=input_image,
@@ -101,45 +129,38 @@ def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[
         num_images_per_prompt=args.count,
         cross_attention_kwargs={"scale": args.lora_weight},
     ).images
-    return images
 
 
 def save_images(images: list[Image.Image], prefix: str = "output"):
     OUTPUT_DIR.mkdir(exist_ok=True)
-    saved = []
-    for i, img in enumerate(images):
-        # 이미 같은 이름이 있으면 번호 증가
+    for img in images:
         idx = 0
         while True:
-            name = f"{prefix}_{idx:03d}.png" if len(images) > 1 or idx > 0 else f"{prefix}.png"
+            name = f"{prefix}.png" if idx == 0 else f"{prefix}_{idx:03d}.png"
             path = OUTPUT_DIR / name
             if not path.exists():
                 break
             idx += 1
         img.save(path)
         print(f"저장: {path}")
-        saved.append(path)
-    return saved
-
-
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
 def collect_input_images() -> list[Path]:
-    if not INPUT_DIR.exists():
-        INPUT_DIR.mkdir(exist_ok=True)
-    images = sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
-    return images
+    INPUT_DIR.mkdir(exist_ok=True)
+    return sorted(p for p in INPUT_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
 
+
+# ── 메인 ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Henreader Style LoRA 이미지 생성")
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="생성 프롬프트")
+    parser.add_argument("--prompt", type=str, default=None, help="고정 프롬프트 (미지정시 WD14 태거 자동 추출)")
     parser.add_argument("--count", type=int, default=1, help="생성할 이미지 수")
     parser.add_argument("--steps", type=int, default=25, help="샘플링 스텝 수 (기본 25)")
     parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
     parser.add_argument("--lora_weight", type=float, default=0.8, help="LoRA 가중치 0.6~0.9 (기본 0.8)")
     parser.add_argument("--strength", type=float, default=0.75, help="img2img 변형 강도 0~1 (기본 0.75)")
+    parser.add_argument("--threshold", type=float, default=0.35, help="WD14 태그 임계값 (기본 0.35)")
     args = parser.parse_args()
 
     if not LORA_PATH.exists():
@@ -151,16 +172,27 @@ def main():
 
     if input_images:
         print(f"input/ 에서 {len(input_images)}개 이미지 발견 → img2img 모드")
+        tagger_session, tag_list = load_wd14_tagger()
         pipe = build_img2img_pipeline(device, dtype)
+
         for input_path in input_images:
             print(f"\n처리 중: {input_path.name}")
-            input_image = Image.open(input_path)
-            images = generate_img2img(pipe, input_image, args.prompt, args)
+            image = Image.open(input_path)
+
+            if args.prompt:
+                prompt = args.prompt
+            else:
+                extracted = tag_image(tagger_session, tag_list, image, args.threshold)
+                prompt = extracted
+                print(f"추출된 태그: {extracted}")
+
+            images = generate_img2img(pipe, image, prompt, args)
             save_images(images, prefix=input_path.stem)
     else:
         print("input/ 이미지 없음 → txt2img 모드")
         pipe = build_txt2img_pipeline(device, dtype)
-        images = generate_txt2img(pipe, args.prompt, args)
+        prompt = args.prompt if args.prompt else DEFAULT_PROMPT
+        images = generate_txt2img(pipe, prompt, args)
         save_images(images, prefix="henreader")
 
     print("\n완료!")
