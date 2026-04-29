@@ -189,7 +189,7 @@ def main():
     parser.add_argument("--count", type=int, default=1, help="장당 생성 수")
     parser.add_argument("--steps", type=int, default=30, help="샘플링 단계 (기본 30)")
     parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
-    parser.add_argument("--lora_weight", type=float, default=0.4, help="LoRA 가중치 (기본 0.5)")
+    parser.add_argument("--lora_weight", type=float, default=0.6, help="LoRA 가중치 (기본 0.5)")
     parser.add_argument("--strength", type=float, default=0.65, help="img2img 변형 강도 (기본 0.65)")
     parser.add_argument("--threshold", type=float, default=0.35, help="태거 민감도 (기본 0.35)")
     args = parser.parse_args()
