@@ -21,7 +21,7 @@ from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
 from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler
 from huggingface_hub import hf_hub_download
 from PIL import Image, ImageOps
-
+from safetensors.torch import load_file  # <- 이 줄을 반드시 추가해 주세요!
 
 # ── 1. 설정 및 경로 ────────────────────────────────────────────────────────────
 
@@ -53,7 +53,6 @@ def load_wd14_tagger():
     session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     return session, tags
 
-
 def tag_image(session, tags, image: Image.Image, threshold: float = 0.35) -> str:
     target = 448
     img = image.convert("RGB")
@@ -81,9 +80,8 @@ def get_device():
     if torch.cuda.is_available():
         print(f"GPU 감지됨: {torch.cuda.get_device_name(0)}")
         return "cuda", torch.float16
-    print("GPU 없음 - CPU 사용 (경고: 매우 느림)")
+    print("GPU 없음 - CPU 사용")
     return "cpu", torch.float32
-
 
 def build_txt2img_pipeline(device: str, dtype: torch.dtype):
     print(f"txt2img 모델 및 고화질 VAE 로딩: {BASE_MODEL}")
@@ -101,33 +99,45 @@ def build_txt2img_pipeline(device: str, dtype: torch.dtype):
     # 2D 애니메이션 선화 처리에 특화된 Euler a 샘플러 강제 적용
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     
-    pipe.load_lora_weights(str(LORA_PATH))
+    print("PEFT 버그 우회: UNet 가중치 독립 주입 중...")
+    state_dict = load_file(str(LORA_PATH))
+    # 에러를 유발하는 text_encoder 가중치를 필터링하여 제거
+    unet_dict = {k: v for k, v in state_dict.items() if "text_encoder" not in k and "te_" not in k}
+    pipe.load_lora_weights(unet_dict)
+    
     pipe = pipe.to(device)
     if device == "cuda":
         pipe.enable_attention_slicing()
     return pipe
-
 
 def build_img2img_pipeline(device: str, dtype: torch.dtype):
     print(f"img2img 모델 및 고화질 VAE 로딩: {BASE_MODEL}")
-    
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
-    
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        BASE_MODEL, 
-        vae=vae,
-        torch_dtype=dtype, 
-        safety_checker=None
-    )
-    
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(BASE_MODEL, vae=vae, torch_dtype=dtype, safety_checker=None)
     pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     
-    pipe.load_lora_weights(str(LORA_PATH))
+    print("PEFT 버그 우회: UNet 가중치 독립 주입 중...")
+    state_dict = load_file(str(LORA_PATH))
+    # 에러를 유발하는 text_encoder 가중치를 필터링하여 제거
+    unet_dict = {k: v for k, v in state_dict.items() if "text_encoder" not in k and "te_" not in k}
+    pipe.load_lora_weights(unet_dict)
+    
     pipe = pipe.to(device)
     if device == "cuda":
         pipe.enable_attention_slicing()
     return pipe
-
+    
+    # [수정됨] PEFT 랭크 에러를 우회하는 안전한 LoRA 로딩 방식
+    pipe.load_lora_weights(
+        str(LORA_PATH.parent), 
+        weight_name=LORA_PATH.name, 
+        adapter_name="henreader"
+    )
+    
+    pipe = pipe.to(device)
+    if device == "cuda":
+        pipe.enable_attention_slicing()
+    return pipe
 
 def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
@@ -142,7 +152,6 @@ def generate_txt2img(pipe, prompt: str, args) -> list[Image.Image]:
         num_images_per_prompt=args.count,
         cross_attention_kwargs={"scale": args.lora_weight},
     ).images
-
 
 def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[Image.Image]:
     full_prompt = prompt if TRIGGER in prompt else f"{TRIGGER}, {prompt}"
@@ -166,7 +175,6 @@ def generate_img2img(pipe, input_image: Image.Image, prompt: str, args) -> list[
         cross_attention_kwargs={"scale": args.lora_weight},
     ).images
 
-
 def save_images(images: list[Image.Image], prefix: str = "output"):
     OUTPUT_DIR.mkdir(exist_ok=True)
     for img in images:
@@ -179,7 +187,6 @@ def save_images(images: list[Image.Image], prefix: str = "output"):
             idx += 1
         img.save(path)
         print(f"결과 저장됨: {path}")
-
 
 def collect_input_images() -> list[Path]:
     INPUT_DIR.mkdir(exist_ok=True)
@@ -194,8 +201,12 @@ def main():
     parser.add_argument("--count", type=int, default=1, help="장당 생성 수")
     parser.add_argument("--steps", type=int, default=30, help="샘플링 단계 (기본 30)")
     parser.add_argument("--cfg", type=float, default=7.0, help="CFG Scale (기본 7.0)")
+<<<<<<< Updated upstream
     # 극한 학습 로라에 맞춰 기본 가중치를 0.6으로 하향 조정
     parser.add_argument("--lora_weight", type=float, default=0.6, help="LoRA 가중치 (기본 0.6)")
+=======
+    parser.add_argument("--lora_weight", type=float, default=0.3, help="LoRA 가중치 (기본 0.5)")
+>>>>>>> Stashed changes
     parser.add_argument("--strength", type=float, default=0.65, help="img2img 변형 강도 (기본 0.65)")
     parser.add_argument("--threshold", type=float, default=0.35, help="태거 민감도 (기본 0.35)")
     args = parser.parse_args()
@@ -226,14 +237,13 @@ def main():
             images = generate_img2img(pipe, image, prompt, args)
             save_images(images, prefix=input_path.stem)
     else:
-        print("input 폴더가 비어 있습니다. 텍스트(txt2img) 모드로 시작합니다.")
+        print("input 폴더가 비어 있습니다. txt2img 모드로 시작합니다.")
         pipe = build_txt2img_pipeline(device, dtype)
         prompt = args.prompt if args.prompt else DEFAULT_PROMPT
         images = generate_txt2img(pipe, prompt, args)
         save_images(images, prefix="henreader_gen")
 
     print("\n모든 작업이 완료되었습니다!")
-
 
 if __name__ == "__main__":
     main()
